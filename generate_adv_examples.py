@@ -12,19 +12,73 @@ from __future__ import unicode_literals
 
 import tensorflow as tf
 from tensorflow import keras
+import numpy as np
 
 from cleverhans.attacks import FastGradientMethod
 from cleverhans.compat import flags
 from cleverhans.dataset import MNIST
-from cleverhans.utils import AccuracyReport
 from cleverhans.utils_keras import cnn_model
 from cleverhans.utils_keras import KerasModelWrapper
+from cleverhans.utils import AccuracyReport, other_classes
+
+import matplotlib.pyplot as plt
+import imageio
+import os
+import os.path as osp
 
 FLAGS = flags.FLAGS
 
 NB_EPOCHS = 6
 BATCH_SIZE = 128
 LEARNING_RATE = .001
+
+
+class CNNModel:
+    def __init__(self, dataset, model_type='cnn_model', label_smoothing=.1):
+        self.x_train, self.y_train = dataset.get_set('train')
+        self.x_test, self.y_test = dataset.get_set('test')
+
+        # Obtain Image Parameters
+        self.img_rows, self.img_cols, self.nchannels = self.x_train.shape[1:4]
+        self.nb_classes = self.y_train.shape[1]
+
+        # Label smoothing
+        self.y_train -= label_smoothing * (self.y_train - 1. / self.nb_classes)
+
+        # Define Keras model
+        self.model = cnn_model(img_rows=self.img_rows, img_cols=self.img_cols,
+                          channels=self.nchannels, nb_filters=64,
+                          nb_classes=self.nb_classes)
+        print("Defined Keras model.")
+
+        # To be able to call the model in the custom loss, we need to call it once
+        # before, see https://github.com/tensorflow/tensorflow/issues/23769
+        self.model(self.model.input)
+
+    def compile(self, metrics=['accuracy'], loss='categorical_crossentropy',
+                learning_rate=LEARNING_RATE):
+        self.model.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE),
+                           loss=loss,
+                           metrics=metrics)
+
+    def fit(self, batch_size=BATCH_SIZE,
+            epochs=NB_EPOCHS,
+            verbose=2):
+        self.model.fit(self.x_train, self.y_train,
+                       batch_size=batch_size,
+                       epochs=epochs,
+                       validation_data=(self.x_test, self.y_test),
+                       verbose=verbose)
+
+    def evaluate(self, batch_size=BATCH_SIZE,
+                 verbose=0):
+        loss, acc, adv_acc = self.model.evaluate(self.x_test, self.y_test,
+                                                 batch_size=batch_size,
+                                                 verbose=verbose)
+        return loss, acc, adv_acc
+
+    def predict(self, x):
+        return self.model.predict(x)
 
 
 def mnist_tutorial(train_start=0, train_end=60000, test_start=0,
@@ -45,14 +99,13 @@ def mnist_tutorial(train_start=0, train_end=60000, test_start=0,
     :return: an AccuracyReport object
     """
 
-    # Object used to keep track of (and return) key accuracies
-    report = AccuracyReport()
-
     # Set TF random seed to improve reproducibility
     tf.set_random_seed(1234)
     # Force TensorFlow to use single thread to improve reproducibility
-    config = tf.ConfigProto(intra_op_parallelism_threads=1,
-                            inter_op_parallelism_threads=1)
+    # config = tf.ConfigProto(intra_op_parallelism_threads=1,
+    #                         inter_op_parallelism_threads=1)
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
 
     if keras.backend.image_data_format() != 'channels_last':
         raise NotImplementedError("this tutorial requires keras to be configured to channels_last format")
@@ -64,108 +117,69 @@ def mnist_tutorial(train_start=0, train_end=60000, test_start=0,
     # Get MNIST test data
     mnist = MNIST(train_start=train_start, train_end=train_end,
                   test_start=test_start, test_end=test_end)
-    x_train, y_train = mnist.get_set('train')
-    x_test, y_test = mnist.get_set('test')
 
-    # Obtain Image Parameters
-    img_rows, img_cols, nchannels = x_train.shape[1:4]
-    nb_classes = y_train.shape[1]
+    report = gen_adv_fast_gradient_method(sess, mnist)
+    return report
 
-    # Label smoothing
-    y_train -= label_smoothing * (y_train - 1. / nb_classes)
 
-    # Define Keras model
-    model = cnn_model(img_rows=img_rows, img_cols=img_cols,
-                      channels=nchannels, nb_filters=64,
-                      nb_classes=nb_classes)
-    print("Defined Keras model.")
-
-    # To be able to call the model in the custom loss, we need to call it once
-    # before, see https://github.com/tensorflow/tensorflow/issues/23769
-    model(model.input)
+def gen_adv_fast_gradient_method(sess, dataset, fgsm_params=None,
+                                 testing=False, adv_range=range(0, 20), output_dir='./adv_output'):
+    # Object used to keep track of (and return) key accuracies
+    attack_name = "fast_gradient_method"
+    report = AccuracyReport()
+    model = CNNModel(dataset)
 
     # Initialize the Fast Gradient Sign Method (FGSM) attack object
-    wrap = KerasModelWrapper(model)
+    wrap = KerasModelWrapper(model.model)
     fgsm = FastGradientMethod(wrap, sess=sess)
-    fgsm_params = {'eps': 0.3,
-                   'clip_min': 0.,
-                   'clip_max': 1.}
+    if fgsm_params is None:
+        fgsm_params = {'eps': 0.3, 'clip_min': 0., 'clip_max': 1., 'y_target': None}
 
-    adv_acc_metric = get_adversarial_acc_metric(model, fgsm, fgsm_params)
+    adv_acc_metric = get_adversarial_acc_metric(model.model, fgsm, fgsm_params)
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate),
         loss='categorical_crossentropy',
-        metrics=['accuracy', adv_acc_metric]
-    )
+        metrics=['accuracy', adv_acc_metric])
 
     # Train an MNIST model
-    model.fit(x_train, y_train,
-              batch_size=batch_size,
-              epochs=nb_epochs,
-              validation_data=(x_test, y_test),
-              verbose=2)
+    model.fit()
 
     # Evaluate the accuracy on legitimate and adversarial test examples
-    _, acc, adv_acc = model.evaluate(x_test, y_test,
-                                     batch_size=batch_size,
-                                     verbose=0)
+    _, acc, adv_acc = model.evaluate()
     report.clean_train_clean_eval = acc
     report.clean_train_adv_eval = adv_acc
+
     print('Test accuracy on legitimate examples: %0.4f' % acc)
     print('Test accuracy on adversarial examples: %0.4f\n' % adv_acc)
 
+    for sample_ind in adv_range:
+        sample = model.x_test[sample_ind:(sample_ind + 1)]
+        current_class = int(np.argmax(model.y_test[sample_ind]))
+        target_classes = other_classes(model.nb_classes, current_class)
+        if not osp.isdir(osp.join(output_dir, attack_name)):
+            os.mkdir(osp.join(output_dir, attack_name))
+        fn = osp.join(output_dir, attack_name, str(sample_ind) + "_input.tiff")
+        imageio.imwrite(fn, np.reshape(sample, (model.img_rows, model.img_cols)))
+        for target in target_classes:
+            one_hot_target = np.zeros((1, model.nb_classes), dtype=np.float32)
+            one_hot_target[0, target] = 1
+            fgsm_params['y_target'] = one_hot_target
+            adv_x = fgsm.generate_np(sample, **fgsm_params)
+            fn = osp.join(output_dir, attack_name, str(sample_ind) + "_adv{}.tiff".format(target))
+            imageio.imwrite(fn, np.reshape(adv_x, (model.img_rows, model.img_cols)))
+
     # Calculate training error
     if testing:
-        _, train_acc, train_adv_acc = model.evaluate(x_train, y_train,
-                                                     batch_size=batch_size,
-                                                     verbose=0)
+        _, train_acc, train_adv_acc = model.evaluate()
         report.train_clean_train_clean_eval = train_acc
         report.train_clean_train_adv_eval = train_adv_acc
 
-    print("Repeating the process, using adversarial training")
-    # Redefine Keras model
-    model_2 = cnn_model(img_rows=img_rows, img_cols=img_cols,
-                        channels=nchannels, nb_filters=64,
-                        nb_classes=nb_classes)
-    model_2(model_2.input)
-    wrap_2 = KerasModelWrapper(model_2)
-    fgsm_2 = FastGradientMethod(wrap_2, sess=sess)
-
-    # Use a loss function based on legitimate and adversarial examples
-    adv_loss_2 = get_adversarial_loss(model_2, fgsm_2, fgsm_params)
-    adv_acc_metric_2 = get_adversarial_acc_metric(model_2, fgsm_2, fgsm_params)
-    model_2.compile(
-        optimizer=keras.optimizers.Adam(learning_rate),
-        loss=adv_loss_2,
-        metrics=['accuracy', adv_acc_metric_2]
-    )
-
-    # Train an MNIST model
-    model_2.fit(x_train, y_train,
-                batch_size=batch_size,
-                epochs=nb_epochs,
-                validation_data=(x_test, y_test),
-                verbose=2)
-
-    # Evaluate the accuracy on legitimate and adversarial test examples
-    _, acc, adv_acc = model_2.evaluate(x_test, y_test,
-                                       batch_size=batch_size,
-                                       verbose=0)
-    report.adv_train_clean_eval = acc
-    report.adv_train_adv_eval = adv_acc
-    print('Test accuracy on legitimate examples: %0.4f' % acc)
-    print('Test accuracy on adversarial examples: %0.4f\n' % adv_acc)
-
-    # Calculate training error
-    if testing:
-        _, train_acc, train_adv_acc = model_2.evaluate(x_train, y_train,
-                                                       batch_size=batch_size,
-                                                       verbose=0)
-        report.train_adv_train_clean_eval = train_acc
-        report.train_adv_train_adv_eval = train_adv_acc
-
     return report
 
+def generate_mnist_adv_examples():
+    return
+
+def generate_cifar_adv_examples():
+    return
 
 def get_adversarial_acc_metric(model, fgsm, fgsm_params):
     def adv_acc(y, _):
