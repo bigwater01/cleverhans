@@ -13,13 +13,14 @@ from __future__ import unicode_literals
 import tensorflow as tf
 from tensorflow import keras
 import numpy as np
+import logging
 
-from cleverhans.attacks import FastGradientMethod
+from cleverhans.attacks import FastGradientMethod, DeepFool, CarliniWagnerL2
 from cleverhans.compat import flags
 from cleverhans.dataset import MNIST
 from cleverhans.utils_keras import cnn_model
 from cleverhans.utils_keras import KerasModelWrapper
-from cleverhans.utils import AccuracyReport, other_classes
+from cleverhans.utils import AccuracyReport, other_classes, set_log_level
 
 import matplotlib.pyplot as plt
 import imageio
@@ -63,7 +64,7 @@ class CNNModel:
 
     def fit(self, batch_size=BATCH_SIZE,
             epochs=NB_EPOCHS,
-            verbose=2):
+            verbose=1):
         self.model.fit(self.x_train, self.y_train,
                        batch_size=batch_size,
                        epochs=epochs,
@@ -77,11 +78,63 @@ class CNNModel:
                                                  verbose=verbose)
         return loss, acc, adv_acc
 
-    def predict(self, x):
-        return self.model.predict(x)
+    def predict_one(self, x):
+        return self.model.predict(np.reshape(x, (1, self.img_rows, self.img_cols, self.nchannels)))
 
 
-def mnist_tutorial(train_start=0, train_end=60000, test_start=0,
+def mnist_adv(train_start=0, train_end=60000, test_start=0,
+                   test_end=10000, nb_epochs=NB_EPOCHS, batch_size=BATCH_SIZE,
+                   learning_rate=LEARNING_RATE, testing=False,
+                   label_smoothing=0.1):
+    """
+    MNIST CleverHans tutorial
+    :param train_start: index of first training set example
+    :param train_end: index of last training set example
+    :param test_start: index of first test set example
+    :param test_end: index of last test set example
+    :param nb_epochs: number of epochs to train model
+    :param batch_size: size of training batches
+    :param learning_rate: learning rate for training
+    :param testing: if true, training error is calculated
+    :param label_smoothing: float, amount of label smoothing for cross entropy
+    :return: an AccuracyReport object
+    """
+
+    set_log_level(logging.WARNING)
+
+    # Set TF random seed to improve reproducibility
+    tf.set_random_seed(1234)
+    # Force TensorFlow to use single thread to improve reproducibility
+    # config = tf.ConfigProto(intra_op_parallelism_threads=1,
+    #                         inter_op_parallelism_threads=1)
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+
+    if keras.backend.image_data_format() != 'channels_last':
+        raise NotImplementedError("this tutorial requires keras to be configured to channels_last format")
+
+    # Create TF session and set as Keras backend session
+    sess = tf.Session(config=config)
+    keras.backend.set_session(sess)
+
+    # Get MNIST test data
+    mnist = MNIST(train_start=train_start, train_end=train_end,
+                  test_start=test_start, test_end=test_end)
+
+    fgsm_params = {'eps': 0.3, 'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    gen_adv(sess=sess, dataset=mnist, dataset_name='mnist', attack_method=FastGradientMethod,
+            attack_params=fgsm_params, attack_name='fast_gradient_method', show_prediction=True)
+
+    deep_fool_params = {'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    gen_adv(sess=sess, dataset=mnist, dataset_name='mnist', attack_method=DeepFool,
+            attack_params=deep_fool_params, attack_name='deep_fool', show_prediction=True)
+
+    cwl2_params = {'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    gen_adv(sess=sess, dataset=mnist, dataset_name='mnist', attack_method=CarliniWagnerL2,
+            attack_params=cwl2_params, attack_name='carlini_wagner_l2', show_prediction=True)
+
+
+def cifar_adv(train_start=0, train_end=60000, test_start=0,
                    test_end=10000, nb_epochs=NB_EPOCHS, batch_size=BATCH_SIZE,
                    learning_rate=LEARNING_RATE, testing=False,
                    label_smoothing=0.1):
@@ -118,24 +171,33 @@ def mnist_tutorial(train_start=0, train_end=60000, test_start=0,
     mnist = MNIST(train_start=train_start, train_end=train_end,
                   test_start=test_start, test_end=test_end)
 
-    report = gen_adv_fast_gradient_method(sess, mnist)
-    return report
+    # fgsm_params = {'eps': 0.3, 'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    # gen_adv(sess=sess, dataset=mnist, dataset_name='mnist', attack_method=FastGradientMethod,
+    #         attack_params=fgsm_params, attack_name='fast_gradient_method', show_prediction=True)
+    #
+    # deep_fool_params = {'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    # gen_adv(sess=sess, dataset=mnist, dataset_name='mnist', attack_method=DeepFool,
+    #         attack_params=deep_fool_params, attack_name='deep_fool', show_prediction=True)
+
+    cwl2_params = {'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    gen_adv(sess=sess, dataset=mnist, dataset_name='mnist', attack_method=CarliniWagnerL2,
+            attack_params=cwl2_params, attack_name='carlini_wagner_l2', show_prediction=True)
 
 
-def gen_adv_fast_gradient_method(sess, dataset, fgsm_params=None,
-                                 testing=False, adv_range=range(0, 20), output_dir='./adv_output'):
+def gen_adv(sess, dataset, dataset_name, attack_method, attack_params, attack_name,
+            testing=False, adv_range=range(0, 20), output_dir='./adv_output', show_prediction=False):
     # Object used to keep track of (and return) key accuracies
-    attack_name = "fast_gradient_method"
+    print("========= Start attack with method {} on {} =========".format(attack_name, dataset_name))
     report = AccuracyReport()
     model = CNNModel(dataset)
 
     # Initialize the Fast Gradient Sign Method (FGSM) attack object
     wrap = KerasModelWrapper(model.model)
-    fgsm = FastGradientMethod(wrap, sess=sess)
-    if fgsm_params is None:
-        fgsm_params = {'eps': 0.3, 'clip_min': 0., 'clip_max': 1., 'y_target': None}
+    attack = attack_method(wrap, sess=sess)
+    # if fgsm_params is None:
+    #     fgsm_params = {'eps': 0.3, 'clip_min': 0., 'clip_max': 1., 'y_target': None}
 
-    adv_acc_metric = get_adversarial_acc_metric(model.model, fgsm, fgsm_params)
+    adv_acc_metric = get_adversarial_acc_metric(model.model, attack, attack_params)
     model.compile(
         loss='categorical_crossentropy',
         metrics=['accuracy', adv_acc_metric])
@@ -155,17 +217,21 @@ def gen_adv_fast_gradient_method(sess, dataset, fgsm_params=None,
         sample = model.x_test[sample_ind:(sample_ind + 1)]
         current_class = int(np.argmax(model.y_test[sample_ind]))
         target_classes = other_classes(model.nb_classes, current_class)
-        if not osp.isdir(osp.join(output_dir, attack_name)):
-            os.mkdir(osp.join(output_dir, attack_name))
-        fn = osp.join(output_dir, attack_name, str(sample_ind) + "_input.tiff")
+        if not osp.isdir(osp.join(output_dir, dataset_name, attack_name)):
+            os.makedirs(osp.join(output_dir, dataset_name, attack_name), )
+        fn = osp.join(output_dir, dataset_name, attack_name, str(sample_ind) + "_input.tiff")
         imageio.imwrite(fn, np.reshape(sample, (model.img_rows, model.img_cols)))
+        if show_prediction:
+            print("Prediction for the input is: \n", model.predict_one(sample))
         for target in target_classes:
             one_hot_target = np.zeros((1, model.nb_classes), dtype=np.float32)
             one_hot_target[0, target] = 1
-            fgsm_params['y_target'] = one_hot_target
-            adv_x = fgsm.generate_np(sample, **fgsm_params)
-            fn = osp.join(output_dir, attack_name, str(sample_ind) + "_adv{}.tiff".format(target))
+            attack_params['y_target'] = one_hot_target
+            adv_x = attack.generate_np(sample, **attack_params)
+            fn = osp.join(output_dir, dataset_name, attack_name, str(sample_ind) + "_adv{}.tiff".format(target))
             imageio.imwrite(fn, np.reshape(adv_x, (model.img_rows, model.img_cols)))
+            if show_prediction:
+                print("Prediction for the target {} is: \n".format(target), model.predict_one(adv_x))
 
     # Calculate training error
     if testing:
@@ -173,6 +239,7 @@ def gen_adv_fast_gradient_method(sess, dataset, fgsm_params=None,
         report.train_clean_train_clean_eval = train_acc
         report.train_clean_train_adv_eval = train_adv_acc
 
+    print("========= Finish attack with method {} on {} =========".format(attack_name, dataset_name))
     return report
 
 def generate_mnist_adv_examples():
@@ -218,9 +285,9 @@ def main(argv=None):
     from cleverhans_tutorials import check_installation
     check_installation(__file__)
 
-    mnist_tutorial(nb_epochs=FLAGS.nb_epochs,
-                   batch_size=FLAGS.batch_size,
-                   learning_rate=FLAGS.learning_rate)
+    mnist_adv(nb_epochs=FLAGS.nb_epochs,
+              batch_size=FLAGS.batch_size,
+              learning_rate=FLAGS.learning_rate)
 
 
 if __name__ == '__main__':
